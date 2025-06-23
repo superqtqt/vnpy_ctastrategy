@@ -52,20 +52,20 @@ class BacktestingEngine:
 
     def __init__(self) -> None:
         """"""
-        self.vt_symbol: str = ""
-        self.symbol: str = ""
-        self.exchange: Exchange
-        self.start: datetime
-        self.end: datetime
-        self.rate: float = 0
-        self.slippage: float = 0
-        self.size: float = 1
-        self.pricetick: float = 0
-        self.capital: int = 1_000_000
-        self.risk_free: float = 0
-        self.annual_days: int = 240
-        self.half_life: int = 120
-        self.mode: BacktestingMode = BacktestingMode.BAR
+        self.vt_symbol: str = ""                # 合约的vt系统代码（如rb2110.SHFE）
+        self.symbol: str = ""                   # 合约代码（如rb2110）
+        self.exchange: Exchange                 # 交易所枚举（如Exchange.SHFE）
+        self.start: datetime                    # 回测开始时间
+        self.end: datetime                      # 回测结束时间
+        self.rate: float = 0                    # 交易手续费率（如0.0001表示万分之一）
+        self.slippage: float = 0                # 交易滑点（每手滑点，单位与价格一致）
+        self.size: float = 1                    # 合约乘数（每手合约代表的数量）
+        self.pricetick: float = 0               # 最小价格变动单位
+        self.capital: int = 1_000_000           # 初始资金
+        self.risk_free: float = 0               # 无风险利率（用于夏普比率等指标计算）
+        self.annual_days: int = 240             # 一年交易日数量（用于年化收益等指标计算）
+        self.half_life: int = 120               # 半衰期参数（用于加权指标等）
+        self.mode: BacktestingMode = BacktestingMode.BAR  # 回测模式（K线/Bar或Tick）
 
         self.strategy_class: type[CtaTemplate]
         self.strategy: CtaTemplate
@@ -93,6 +93,7 @@ class BacktestingEngine:
 
         self.daily_results: dict[Date, DailyResult] = {}
         self.daily_df: DataFrame
+        self.max_volume_tread_percent: float = 0.05
 
     def clear_data(self) -> None:
         """
@@ -126,7 +127,8 @@ class BacktestingEngine:
         mode: BacktestingMode = BacktestingMode.BAR,
         risk_free: float = 0,
         annual_days: int = 240,
-        half_life: int = 120
+        half_life: int = 120,
+        max_volume_tread_percent: float = 0.05
     ) -> None:
         """"""
         self.mode = mode
@@ -151,6 +153,7 @@ class BacktestingEngine:
         self.risk_free = risk_free
         self.annual_days = annual_days
         self.half_life = half_life
+        self.max_volume_tread_percent = max_volume_tread_percent
 
     def add_strategy(self, strategy_class: type[CtaTemplate], setting: dict) -> None:
         """"""
@@ -637,59 +640,85 @@ class BacktestingEngine:
 
     def cross_limit_order(self) -> None:
         """
-        Cross limit order with last bar/tick data.
+        用最新的K线或Tick数据撮合限价单。
         """
+        # 根据回测模式，确定多空方向的撮合价格和最优成交价
         if self.mode == BacktestingMode.BAR:
-            long_cross_price = self.bar.low_price
-            short_cross_price = self.bar.high_price
-            long_best_price = self.bar.open_price
-            short_best_price = self.bar.open_price
+            long_cross_price = self.bar.low_price         # 多单撮合价：K线最低价
+            short_cross_price = self.bar.high_price       # 空单撮合价：K线最高价
+            long_best_price = self.bar.open_price         # 多单最优成交价：K线开盘价
+            short_best_price = self.bar.open_price        # 空单最优成交价：K线开盘价
         else:
-            long_cross_price = self.tick.ask_price_1
-            short_cross_price = self.tick.bid_price_1
-            long_best_price = long_cross_price
-            short_best_price = short_cross_price
+            long_cross_price = self.tick.ask_price_1      # 多单撮合价：盘口卖一价
+            short_cross_price = self.tick.bid_price_1     # 空单撮合价：盘口买一价
+            long_best_price = long_cross_price            # 多单最优成交价
+            short_best_price = short_cross_price          # 空单最优成交价
 
+        # 遍历所有活动中的限价单
         for order in list(self.active_limit_orders.values()):
-            # Push order update with status "not traded" (pending).
+            # 如果订单状态为"正在提交"，先推送"未成交"状态
             if order.status == Status.SUBMITTING:
                 order.status = Status.NOTTRADED
                 self.strategy.on_order(order)
 
-            # Check whether limit orders can be filled.
+            # 判断多单是否可以成交
             long_cross: bool = (
                 order.direction == Direction.LONG
                 and order.price >= long_cross_price
                 and long_cross_price > 0
             )
 
+            # 判断空单是否可以成交
             short_cross: bool = (
                 order.direction == Direction.SHORT
                 and order.price <= short_cross_price
                 and short_cross_price > 0
             )
 
+            # 如果既不是多单成交，也不是空单成交，跳过
             if not long_cross and not short_cross:
                 continue
 
-            # Push order udpate with status "all traded" (filled).
-            order.traded = order.volume
-            order.status = Status.ALLTRADED
+            # 撮合成功，推送"全部成交"或"部分成交"状态（根据volume_percent限制）
+            # 1. 计算当前bar或tick允许的最大可成交量（受volume_percent限制）
+            max_volume = 0
+            if self.mode == BacktestingMode.BAR:
+                # K线模式下，最大成交量为当前K线总成交量的volume_percent比例
+                max_volume = int(self.bar.volume * self.max_volume_tread_percent)
+            else:
+                # Tick模式下，最大成交量为当前tick总成交量的volume_percent比例
+                max_volume = int(self.tick.volume * self.max_volume_tread_percent)
+            # 2. max_volume需为合约size的整数倍，防止出现非整数手
+            max_volume = int(max_volume / self.size) * self.size
+            # 3. 实际可成交量为剩余未成交量与max_volume的较小值
+            trade_volume = min(order.volume - order.traded, max_volume)
+            # 4. 累加到订单已成交量
+            order.traded += trade_volume
+            # 5. 若本次撮合无成交，则跳过
+            if trade_volume == 0:
+                continue
+            # 6. 判断订单状态：部分成交或全部成交
+            if trade_volume < order.volume:
+                order.status = Status.PARTTRADED  # 部分成交
+            else:
+                order.status = Status.ALLTRADED   # 全部成交
             self.strategy.on_order(order)
 
-            if order.vt_orderid in self.active_limit_orders:
+            # 从活动订单中移除已成交订单
+            if order.status == Status.ALLTRADED and order.vt_orderid in self.active_limit_orders:
                 self.active_limit_orders.pop(order.vt_orderid)
 
-            # Push trade update
+            # 生成成交记录
             self.trade_count += 1
 
             if long_cross:
-                trade_price = min(order.price, long_best_price)
-                pos_change = order.volume
+                trade_price = min(order.price, long_best_price)  # 成交价取下单价和最优价的较小值
+                pos_change = trade_volume                        # 持仓增加
             else:
-                trade_price = max(order.price, short_best_price)
-                pos_change = -order.volume
+                trade_price = max(order.price, short_best_price) # 成交价取下单价和最优价的较大值
+                pos_change = -trade_volume                       # 持仓减少
 
+            # 创建成交数据对象
             trade: TradeData = TradeData(
                 symbol=order.symbol,
                 exchange=order.exchange,
@@ -698,33 +727,38 @@ class BacktestingEngine:
                 direction=order.direction,
                 offset=order.offset,
                 price=trade_price,
-                volume=order.volume,
+                volume=trade_volume,
                 datetime=self.datetime,
                 gateway_name=self.gateway_name,
             )
 
+            # 更新策略持仓
             self.strategy.pos += pos_change
+            # 推送成交事件
             self.strategy.on_trade(trade)
 
+            # 保存成交记录
             self.trades[trade.vt_tradeid] = trade
 
     def cross_stop_order(self) -> None:
         """
-        Cross stop order with last bar/tick data.
+        用最新的K线或Tick数据撮合止损单。
         """
+        # 1. 根据回测模式，确定多空方向的触发价格和最优成交价
         if self.mode == BacktestingMode.BAR:
-            long_cross_price = self.bar.high_price
-            short_cross_price = self.bar.low_price
-            long_best_price = self.bar.open_price
-            short_best_price = self.bar.open_price
+            long_cross_price = self.bar.high_price      # 多单触发价：K线最高价
+            short_cross_price = self.bar.low_price      # 空单触发价：K线最低价
+            long_best_price = self.bar.open_price       # 多单最优成交价：K线开盘价
+            short_best_price = self.bar.open_price      # 空单最优成交价：K线开盘价
         else:
-            long_cross_price = self.tick.last_price
-            short_cross_price = self.tick.last_price
-            long_best_price = long_cross_price
-            short_best_price = short_cross_price
+            long_cross_price = self.tick.last_price     # 多单触发价：最新成交价
+            short_cross_price = self.tick.last_price    # 空单触发价：最新成交价
+            long_best_price = long_cross_price          # 多单最优成交价
+            short_best_price = short_cross_price        # 空单最优成交价
 
+        # 2. 遍历所有活动中的止损单
         for stop_order in list(self.active_stop_orders.values()):
-            # Check whether stop order can be triggered.
+            # 判断止损单是否可以被触发
             long_cross: bool = (
                 stop_order.direction == Direction.LONG
                 and stop_order.price <= long_cross_price
@@ -735,10 +769,11 @@ class BacktestingEngine:
                 and stop_order.price >= short_cross_price
             )
 
+            # 如果当前价格未触发止损条件，跳过
             if not long_cross and not short_cross:
                 continue
 
-            # Create order data.
+            # 3. 创建对应的限价委托单（止损单被触发后，转为市价/限价单成交）
             self.limit_order_count += 1
 
             order: OrderData = OrderData(
@@ -757,13 +792,13 @@ class BacktestingEngine:
 
             self.limit_orders[order.vt_orderid] = order
 
-            # Create trade data.
+            # 4. 创建成交数据对象
             if long_cross:
-                trade_price = max(stop_order.price, long_best_price)
-                pos_change = order.volume
+                trade_price = max(stop_order.price, long_best_price)  # 多单：取止损价和最优价的较大值
+                pos_change = order.volume                             # 持仓增加
             else:
-                trade_price = min(stop_order.price, short_best_price)
-                pos_change = -order.volume
+                trade_price = min(stop_order.price, short_best_price) # 空单：取止损价和最优价的较小值
+                pos_change = -order.volume                            # 持仓减少
 
             self.trade_count += 1
 
@@ -782,14 +817,14 @@ class BacktestingEngine:
 
             self.trades[trade.vt_tradeid] = trade
 
-            # Update stop order.
+            # 5. 更新止损单状态为已触发，并移出活动止损单列表
             stop_order.vt_orderids.append(order.vt_orderid)
             stop_order.status = StopOrderStatus.TRIGGERED
 
             if stop_order.stop_orderid in self.active_stop_orders:
                 self.active_stop_orders.pop(stop_order.stop_orderid)
 
-            # Push update to strategy.
+            # 6. 推送止损单、委托单和成交事件到策略
             self.strategy.on_stop_order(stop_order)
             self.strategy.on_order(order)
 
@@ -852,6 +887,7 @@ class BacktestingEngine:
         net: bool
     ) -> list:
         """"""
+        # FIXME 成交的时候要看历史的数据能否支撑这个成交量
         price = round_to(price, self.pricetick)
         if stop:
             vt_orderid: str = self.send_stop_order(direction, offset, price, volume)
