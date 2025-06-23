@@ -94,6 +94,7 @@ class BacktestingEngine:
         self.daily_results: dict[Date, DailyResult] = {}
         self.daily_df: DataFrame
         self.max_volume_tread_percent: float = 0.05
+        self.standard_vt_symbol: str = ""
 
     def clear_data(self) -> None:
         """
@@ -128,7 +129,8 @@ class BacktestingEngine:
         risk_free: float = 0,
         annual_days: int = 240,
         half_life: int = 120,
-        max_volume_tread_percent: float = 0.05
+        max_volume_tread_percent: float = 0.05,
+        standard_vt_symbol: str = ""
     ) -> None:
         """"""
         self.mode = mode
@@ -154,6 +156,7 @@ class BacktestingEngine:
         self.annual_days = annual_days
         self.half_life = half_life
         self.max_volume_tread_percent = max_volume_tread_percent
+        self.standard_vt_symbol = standard_vt_symbol
 
     def add_strategy(self, strategy_class: type[CtaTemplate], setting: dict) -> None:
         """"""
@@ -289,6 +292,43 @@ class BacktestingEngine:
                 results[key].append(value)
 
         self.daily_df = DataFrame.from_dict(results).set_index("date")
+
+        # 增加净值（nav）列，初始为1，后续为当日资金余额/初始资金
+        self.daily_df["balance"] = self.daily_df["net_pnl"].cumsum() + self.capital
+        self.daily_df["nav"] = self.daily_df["balance"] / self.capital
+
+        # 如果standard_vt_symbol不为空，拉取该标的的历史数据，计算标准净值（standard_nav）
+        if self.standard_vt_symbol:
+            # 拆分symbol和exchange
+            std_symbol, std_exchange_str = self.standard_vt_symbol.split(".")
+            std_exchange = Exchange(std_exchange_str)
+            # 拉取标准合约的历史K线数据
+            std_bars = load_bar_data(
+                std_symbol,
+                std_exchange,
+                self.interval,
+                self.start,
+                self.end
+            )
+            # 构建标准合约的收盘价序列（以date为索引）
+            std_close_dict = {bar.datetime.date(): bar.close_price for bar in std_bars}
+            # 对齐当前回测日期，生成标准净值序列
+            std_close_list = []
+            for d in self.daily_df.index:
+                std_close_list.append(std_close_dict.get(d, None))
+            # 用第一个有效收盘价为基准，计算净值，首日净值为1
+            std_close_arr = np.array(std_close_list, dtype=np.float64)
+            valid = ~np.isnan(std_close_arr)
+            if valid.any():
+                base_price = std_close_arr[valid][0]
+                standard_nav = std_close_arr / base_price
+                # 保证第一个有效净值为1
+                first_valid_idx = np.where(valid)[0][0]
+                if not np.isnan(standard_nav[first_valid_idx]):
+                    standard_nav[first_valid_idx] = 1.0
+            else:
+                standard_nav = np.full_like(std_close_arr, np.nan)
+            self.daily_df["standard_nav"] = standard_nav
 
         self.output(_("逐日盯市盈亏计算完成"))
         return self.daily_df
@@ -494,7 +534,6 @@ class BacktestingEngine:
         self.output(_("策略统计指标计算完成"))
         return statistics
 
-    # def show_chart(self, df: DataFrame = None) -> None:
     def show_chart(self, df: DataFrame | None = None) -> go.Figure:
         """"""
         # Check DataFrame input exterior
@@ -506,9 +545,9 @@ class BacktestingEngine:
             return
 
         fig = make_subplots(
-            rows=4,
+            rows=5,
             cols=1,
-            subplot_titles=["Balance", "Drawdown", "Daily Pnl", "Pnl Distribution"],
+            subplot_titles=["Balance", "Drawdown", "Daily Pnl", "Pnl Distribution", "NAV vs Standard NAV"],
             vertical_spacing=0.06
         )
 
@@ -530,12 +569,31 @@ class BacktestingEngine:
         pnl_bar = go.Bar(y=df["net_pnl"], name="Daily Pnl")
         pnl_histogram = go.Histogram(x=df["net_pnl"], nbinsx=100, name="Days")
 
+        # 新增：净值对比图
+        nav_line = go.Scatter(
+            x=df.index,
+            y=df["nav"],
+            mode="lines",
+            name="NAV"
+        )
+        traces = [nav_line]
+        if "standard_nav" in df.columns:
+            standard_nav_line = go.Scatter(
+                x=df.index,
+                y=df["standard_nav"],
+                mode="lines",
+                name="Standard NAV"
+            )
+            traces.append(standard_nav_line)
+
         fig.add_trace(balance_line, row=1, col=1)
         fig.add_trace(drawdown_scatter, row=2, col=1)
         fig.add_trace(pnl_bar, row=3, col=1)
         fig.add_trace(pnl_histogram, row=4, col=1)
+        for trace in traces:
+            fig.add_trace(trace, row=5, col=1)
 
-        fig.update_layout(height=1000, width=1000)
+        fig.update_layout(height=1200, width=1000)
         return fig
 
     def run_bf_optimization(
