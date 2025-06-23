@@ -269,8 +269,8 @@ class BacktestingEngine:
             daily_result.add_trade(trade)
 
         # Calculate daily result by iteration.
-        pre_close: float = 0
-        start_pos: float = 0
+        pre_close: float = 0 # 前一日收盘价
+        start_pos: float = 0 # 初始化为开始持仓
 
         for daily_result in self.daily_results.values():
             daily_result.calculate_pnl(
@@ -747,7 +747,7 @@ class BacktestingEngine:
                 # Tick模式下，最大成交量为当前tick总成交量的volume_percent比例
                 max_volume = int(self.tick.volume * self.max_volume_tread_percent)
             # 2. max_volume需为合约size的整数倍，防止出现非整数手
-            max_volume = int(max_volume / self.size) * self.size
+            max_volume = int(max_volume / self.size) 
             # 3. 实际可成交量为剩余未成交量与max_volume的较小值
             trade_volume = min(order.volume - order.traded, max_volume)
             # 4. 累加到订单已成交量
@@ -1144,11 +1144,11 @@ class DailyResult:
 
     def calculate_pnl(
         self,
-        pre_close: float,
-        start_pos: float,
+        pre_close: float, # 前一日收盘价
+        start_pos: float, # 当前持仓量
         size: float,
-        rate: float,
-        slippage: float
+        rate: float, # 手续费
+        slippage: float # 滑点
     ) -> None:
         """"""
         # If no pre_close provided on the first day,
