@@ -679,9 +679,10 @@ class BacktestingEngine:
         self.bar = bar
         self.datetime = bar.datetime
 
+        
+        self.strategy.on_bar(bar)
         self.cross_limit_order()
         self.cross_stop_order()
-        self.strategy.on_bar(bar)
 
         self.update_daily_close(bar.close_price)
 
@@ -690,9 +691,10 @@ class BacktestingEngine:
         self.tick = tick
         self.datetime = tick.datetime
 
+       
+        self.strategy.on_tick(tick)
         self.cross_limit_order()
         self.cross_stop_order()
-        self.strategy.on_tick(tick)
 
         self.update_daily_close(tick.last_price)
 
@@ -714,6 +716,10 @@ class BacktestingEngine:
 
         # 遍历所有活动中的限价单
         for order in list(self.active_limit_orders.values()):
+            # 检查当前单与交易日期是否一致
+            if order.datetime.date() != self.datetime.date():
+                continue
+
             # 如果订单状态为"正在提交"，先推送"未成交"状态
             if order.status == Status.SUBMITTING:
                 order.status = Status.NOTTRADED
